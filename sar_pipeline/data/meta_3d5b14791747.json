@@ -1,0 +1,61 @@
+{
+  "run_id": "3d5b14791747",
+  "targets_sorted": [
+    "CHEMBL1867",
+    "CHEMBL2056",
+    "CHEMBL213",
+    "CHEMBL214",
+    "CHEMBL217",
+    "CHEMBL219",
+    "CHEMBL222",
+    "CHEMBL224",
+    "CHEMBL225",
+    "CHEMBL228",
+    "CHEMBL231",
+    "CHEMBL234",
+    "CHEMBL238",
+    "CHEMBL3155"
+  ],
+  "target_to_idx": {
+    "CHEMBL1867": 0,
+    "CHEMBL2056": 1,
+    "CHEMBL213": 2,
+    "CHEMBL214": 3,
+    "CHEMBL217": 4,
+    "CHEMBL219": 5,
+    "CHEMBL222": 6,
+    "CHEMBL224": 7,
+    "CHEMBL225": 8,
+    "CHEMBL228": 9,
+    "CHEMBL231": 10,
+    "CHEMBL234": 11,
+    "CHEMBL238": 12,
+    "CHEMBL3155": 13
+  },
+  "std_types_sorted": [
+    "AC50",
+    "EC50",
+    "ED50",
+    "IC50",
+    "Kd",
+    "Ki"
+  ],
+  "std_to_idx": {
+    "AC50": 0,
+    "EC50": 1,
+    "ED50": 2,
+    "IC50": 3,
+    "Kd": 4,
+    "Ki": 5
+  },
+  "n_targets": 14,
+  "n_std_types": 6,
+  "fp_key": "fe52da017033",
+  "X_path": "sar_pipeline/cache/X_morgan_fe52da017033.npy",
+  "smiles_path": "sar_pipeline/cache/smiles_fe52da017033.json",
+  "rows_path": "sar_pipeline/data/rows_3d5b14791747.parquet",
+  "measurements_path": "sar_pipeline/data/measurements_3d5b14791747.parquet",
+  "radius": 2,
+  "n_bits": 2048,
+  "seed": 0
+}

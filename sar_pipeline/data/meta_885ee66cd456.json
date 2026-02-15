@@ -1,0 +1,47 @@
+{
+  "run_id": "885ee66cd456",
+  "targets_sorted": [
+    "CHEMBL214",
+    "CHEMBL217",
+    "CHEMBL222",
+    "CHEMBL224",
+    "CHEMBL228",
+    "CHEMBL238"
+  ],
+  "target_to_idx": {
+    "CHEMBL214": 0,
+    "CHEMBL217": 1,
+    "CHEMBL222": 2,
+    "CHEMBL224": 3,
+    "CHEMBL228": 4,
+    "CHEMBL238": 5
+  },
+  "assay_to_idx": {
+    "B": 0,
+    "F": 1
+  },
+  "std_types_sorted": [
+    "AC50",
+    "EC50",
+    "IC50",
+    "Kd",
+    "Ki"
+  ],
+  "std_to_idx": {
+    "AC50": 0,
+    "EC50": 1,
+    "IC50": 2,
+    "Kd": 3,
+    "Ki": 4
+  },
+  "n_targets": 6,
+  "n_std_types": 5,
+  "fp_key": "1033d7630ce8",
+  "X_path": "sar_pipeline/cache/X_morgan_1033d7630ce8.npy",
+  "smiles_path": "sar_pipeline/cache/smiles_1033d7630ce8.json",
+  "rows_path": "sar_pipeline/data/rows_885ee66cd456.parquet",
+  "measurements_path": "sar_pipeline/data/measurements_885ee66cd456.parquet",
+  "radius": 2,
+  "n_bits": 2048,
+  "seed": 0
+}
