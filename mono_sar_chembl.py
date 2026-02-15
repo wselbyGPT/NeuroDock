@@ -6,12 +6,24 @@ End-to-end:
 - Pull ChEMBL bioactivity (human) for monoamine transporters + aminergic GPCRs
 - Keep binding (B) + functional (F) assays with valid pChEMBL values
 - Scaffold split by molecule (no leakage)
-- Train conditional Keras regressor: (Morgan FP + target_id + assay_type) -> pChEMBL
-- Report RMSE overall + by target + by assay_type
+- Train a shared-trunk Keras regressor with TWO OUTPUT HEADS:
+    (Morgan FP + target_id + standard_type) -> pChEMBL_B and pChEMBL_F
+  where each head is trained with masked loss (missing labels don't contribute).
+- Report RMSE for B and F heads overall + by target.
+- Save test_predictions.csv with both-head predictions.
 
 Notes:
-- pChEMBL is -log10(molar) for certain standard types and only when standardized to nM and "=".
+- pChEMBL is -log10(molar); we filter standardized rows to nM and '='.
 - assay_type "B"=binding, "F"=functional.
+- standard_type includes Ki/Kd/IC50/EC50/etc; embedded as categorical input.
+- Separate heads helps because B vs F are different modalities/noise regimes.
+
+Requires:
+  pip install pandas numpy tqdm scikit-learn tensorflow rdkit-pypi chembl_downloader
+(or conda-forge RDKit preferred)
+
+Example:
+  python3 mono_sar_chembl.py --outdir mono_sar_out_twohead --epochs 40 --batch 512
 """
 
 from __future__ import annotations
@@ -31,8 +43,8 @@ from sklearn.metrics import mean_squared_error
 
 from rdkit import Chem
 from rdkit import DataStructs
-from rdkit.Chem import AllChem
 from rdkit.Chem.Scaffolds import MurckoScaffold
+from rdkit.Chem import rdFingerprintGenerator
 
 
 # -----------------------------
@@ -60,24 +72,15 @@ class Split:
     test_idx: np.ndarray
 
 
-def get_activity_columns(conn: sqlite3.Connection) -> set:
+def get_table_columns(conn: sqlite3.Connection, table: str) -> set:
     cur = conn.cursor()
-    cur.execute("PRAGMA table_info(activities);")
-    cols = {row[1] for row in cur.fetchall()}  # name in second field
-    return cols
-
-
-def get_assay_columns(conn: sqlite3.Connection) -> set:
-    cur = conn.cursor()
-    cur.execute("PRAGMA table_info(assays);")
-    cols = {row[1] for row in cur.fetchall()}
-    return cols
+    cur.execute(f"PRAGMA table_info({table});")
+    return {row[1] for row in cur.fetchall()}
 
 
 def connect_sqlite(path: str) -> sqlite3.Connection:
     if not os.path.exists(path):
         raise FileNotFoundError(f"ChEMBL SQLite not found: {path}")
-    # read-only is safer for huge files
     uri = f"file:{path}?mode=ro"
     return sqlite3.connect(uri, uri=True)
 
@@ -91,11 +94,13 @@ def fetch_chembl_df(
     single_protein_only: bool = True,
 ) -> pd.DataFrame:
     """
-    Pulls rows at the *measurement* level (one row per activity record)
+    Pull rows at the *measurement* level (one row per activity record)
     using parent molecule via molecule_hierarchy when available.
+
+    Robust to older/newer ChEMBL SQLite schemas by guarding optional columns.
     """
-    act_cols = get_activity_columns(conn)
-    assay_cols = get_assay_columns(conn)
+    act_cols = get_table_columns(conn, "activities")
+    assay_cols = get_table_columns(conn, "assays")
 
     where_parts = [
         "td.chembl_id IN ({})".format(",".join(["?"] * len(targets))),
@@ -113,23 +118,24 @@ def fetch_chembl_df(
     params.extend(list(assay_types))
     params.extend(list(PCHEMBL_STANDARD_TYPES))
 
-    if "confidence_score" in assay_cols:
+    has_conf = "confidence_score" in assay_cols
+    if has_conf:
         where_parts.append("a.confidence_score >= ?")
         params.append(int(min_confidence))
 
     if single_protein_only:
         where_parts.append("td.target_type = 'SINGLE PROTEIN'")
 
-    # Optional quality columns (present in modern ChEMBL)
     if "data_validity_comment" in act_cols:
-        where_parts.append("(act.data_validity_comment IS NULL OR act.data_validity_comment = 'Manually validated')")
-
+        where_parts.append(
+            "(act.data_validity_comment IS NULL OR act.data_validity_comment = 'Manually validated')"
+        )
     if "potential_duplicate" in act_cols:
         where_parts.append("(act.potential_duplicate IS NULL OR act.potential_duplicate = 0)")
 
     where_sql = " AND ".join(where_parts)
+    conf_select = "a.confidence_score AS confidence_score" if has_conf else "NULL AS confidence_score"
 
-    # Use parent molecules when possible to avoid salt duplicates
     sql = f"""
     SELECT
         mdp.chembl_id          AS molecule_chembl_id,
@@ -137,7 +143,7 @@ def fetch_chembl_df(
         td.chembl_id           AS target_chembl_id,
         td.pref_name           AS target_name,
         a.assay_type           AS assay_type,
-        a.confidence_score     AS confidence_score,
+        {conf_select},
         act.standard_type      AS standard_type,
         act.pchembl_value      AS pchembl_value
     FROM activities act
@@ -153,7 +159,7 @@ def fetch_chembl_df(
     """
 
     df = pd.read_sql(sql, conn, params=params)
-    df = df.dropna(subset=["smiles", "pchembl_value", "target_chembl_id", "assay_type"])
+    df = df.dropna(subset=["smiles", "pchembl_value", "target_chembl_id", "assay_type", "standard_type"])
     df["pchembl_value"] = pd.to_numeric(df["pchembl_value"], errors="coerce")
     df = df.dropna(subset=["pchembl_value"])
     return df
@@ -188,7 +194,6 @@ def greedy_scaffold_split(smiles: List[str], frac_val=0.15, frac_test=0.15, seed
         sc = murcko_scaffold_smiles(smi)
         scaff_to_indices.setdefault(sc, []).append(i)
 
-    # sort scaffolds by descending size, but shuffle ties for a bit of randomness
     scaff_items = list(scaff_to_indices.items())
     rng.shuffle(scaff_items)
     scaff_items.sort(key=lambda x: len(x[1]), reverse=True)
@@ -198,7 +203,7 @@ def greedy_scaffold_split(smiles: List[str], frac_val=0.15, frac_test=0.15, seed
     n_val = int(round(frac_val * n))
 
     test, val, train = [], [], []
-    for sc, idxs in scaff_items:
+    for _, idxs in scaff_items:
         if len(test) + len(idxs) <= n_test:
             test.extend(idxs)
         elif len(val) + len(idxs) <= n_val:
@@ -213,98 +218,166 @@ def greedy_scaffold_split(smiles: List[str], frac_val=0.15, frac_test=0.15, seed
     )
 
 
-def morgan_fp_bits(smiles: List[str], radius: int, n_bits: int) -> np.ndarray:
-    X = np.zeros((len(smiles), n_bits), dtype=np.float32)
+def morgan_fp_cache(unique_smiles: List[str], radius: int, n_bits: int) -> Dict[str, np.ndarray]:
+    """
+    Cache Morgan fingerprints per *unique* SMILES using modern RDKit generator API.
+    """
+    gen = rdFingerprintGenerator.GetMorganGenerator(radius=radius, fpSize=n_bits)
+    cache: Dict[str, np.ndarray] = {}
     bad = 0
-    for i, smi in enumerate(tqdm(smiles, desc="Fingerprints")):
+
+    for smi in tqdm(unique_smiles, desc="Fingerprints (unique SMILES)"):
         m = Chem.MolFromSmiles(smi)
         if m is None:
             bad += 1
             continue
-        bv = AllChem.GetMorganFingerprintAsBitVect(m, radius, nBits=n_bits)
+        bv = gen.GetFingerprint(m)
         arr = np.zeros((n_bits,), dtype=np.int8)
         DataStructs.ConvertToNumpyArray(bv, arr)
-        X[i, :] = arr
+        cache[smi] = arr
+
     if bad:
         print(f"[warn] {bad} SMILES failed RDKit parse during fingerprinting.")
+    return cache
+
+
+def build_X_from_cache(rows_smiles: List[str], cache: Dict[str, np.ndarray], n_bits: int) -> np.ndarray:
+    X = np.zeros((len(rows_smiles), n_bits), dtype=np.float32)
+    misses = 0
+    for i, smi in enumerate(rows_smiles):
+        v = cache.get(smi)
+        if v is None:
+            misses += 1
+            continue
+        X[i, :] = v
+    if misses:
+        print(f"[warn] {misses} rows missing fingerprint in cache (will be zero vectors).")
     return X
 
 
-def build_model(fp_dim: int, n_targets: int, n_assay_types: int, target_emb=16, assay_emb=4) -> tf.keras.Model:
+def masked_mse(y_true, y_pred):
+    """
+    y_true is shape (batch, 2): [value, mask]
+    y_pred is shape (batch, 1)
+    """
+    y = y_true[:, 0]
+    m = y_true[:, 1]
+    yhat = tf.squeeze(y_pred, axis=1)
+    se = tf.square(y - yhat) * m
+    denom = tf.reduce_sum(m) + 1e-8
+    return tf.reduce_sum(se) / denom
+
+
+def masked_rmse_metric(name: str):
+    """
+    Returns a Keras metric function that computes RMSE with the same [value, mask] encoding.
+    """
+    def _rmse(y_true, y_pred):
+        y = y_true[:, 0]
+        m = y_true[:, 1]
+        yhat = tf.squeeze(y_pred, axis=1)
+        se = tf.square(y - yhat) * m
+        denom = tf.reduce_sum(m) + 1e-8
+        mse = tf.reduce_sum(se) / denom
+        return tf.sqrt(mse)
+    _rmse.__name__ = name
+    return _rmse
+
+
+def build_twohead_model(
+    fp_dim: int,
+    n_targets: int,
+    n_std_types: int,
+    target_emb: int = 16,
+    std_emb: int = 6,
+) -> tf.keras.Model:
+    """
+    Shared trunk -> 2 heads:
+      - out_B: predicted pChEMBL for binding
+      - out_F: predicted pChEMBL for functional
+    """
     fp_in = tf.keras.Input(shape=(fp_dim,), name="fp")
     t_in = tf.keras.Input(shape=(), dtype="int32", name="target_id")
-    a_in = tf.keras.Input(shape=(), dtype="int32", name="assay_type")
+    s_in = tf.keras.Input(shape=(), dtype="int32", name="standard_type")
 
-    t_emb = tf.keras.layers.Embedding(n_targets, target_emb, name="target_emb")(t_in)
-    a_emb = tf.keras.layers.Embedding(n_assay_types, assay_emb, name="assay_emb")(a_in)
+    t_emb = tf.keras.layers.Flatten()(
+        tf.keras.layers.Embedding(n_targets, target_emb, name="target_emb")(t_in)
+    )
+    s_emb = tf.keras.layers.Flatten()(
+        tf.keras.layers.Embedding(n_std_types, std_emb, name="std_emb")(s_in)
+    )
 
-    t_emb = tf.keras.layers.Flatten()(t_emb)
-    a_emb = tf.keras.layers.Flatten()(a_emb)
-
-    x = tf.keras.layers.Concatenate()([fp_in, t_emb, a_emb])
+    x = tf.keras.layers.Concatenate()([fp_in, t_emb, s_emb])
     x = tf.keras.layers.Dense(1024, activation="relu")(x)
     x = tf.keras.layers.Dropout(0.25)(x)
     x = tf.keras.layers.Dense(256, activation="relu")(x)
     x = tf.keras.layers.Dropout(0.10)(x)
-    out = tf.keras.layers.Dense(1, name="pchembl")(x)
 
-    model = tf.keras.Model([fp_in, t_in, a_in], out)
+    out_b = tf.keras.layers.Dense(1, name="out_B")(x)
+    out_f = tf.keras.layers.Dense(1, name="out_F")(x)
+
+    model = tf.keras.Model(inputs=[fp_in, t_in, s_in], outputs=[out_b, out_f])
     model.compile(
         optimizer=tf.keras.optimizers.Adam(1e-3),
-        loss="mse",
-        metrics=[tf.keras.metrics.RootMeanSquaredError(name="rmse")],
+        loss={"out_B": masked_mse, "out_F": masked_mse},
+        metrics={"out_B": [masked_rmse_metric("rmse_B")], "out_F": [masked_rmse_metric("rmse_F")]},
     )
     return model
 
 
-def rmse(y_true: np.ndarray, y_pred: np.ndarray) -> float:
+def rmse_np(y_true: np.ndarray, y_pred: np.ndarray) -> float:
     return float(np.sqrt(mean_squared_error(y_true, y_pred)))
 
 
-def report_group_rmse(df_rows: pd.DataFrame, y_true: np.ndarray, y_pred: np.ndarray, group_cols: List[str], title: str):
+def report_group_rmse_twohead(
+    df_rows: pd.DataFrame,
+    yb_true: np.ndarray,
+    yb_pred: np.ndarray,
+    mb: np.ndarray,
+    yf_true: np.ndarray,
+    yf_pred: np.ndarray,
+    mf: np.ndarray,
+    group_cols: List[str],
+    title: str,
+):
     tmp = df_rows.copy()
-    tmp["y_true"] = y_true
-    tmp["y_pred"] = y_pred
-    tmp["se"] = (tmp["y_true"] - tmp["y_pred"]) ** 2
 
-    grp = tmp.groupby(group_cols)["se"].mean().reset_index()
-    grp["rmse"] = np.sqrt(grp["se"])
-    grp = grp.sort_values("rmse", ascending=True)
+    tmp["yb_true"] = yb_true
+    tmp["yb_pred"] = yb_pred
+    tmp["mb"] = mb.astype(int)
 
+    tmp["yf_true"] = yf_true
+    tmp["yf_pred"] = yf_pred
+    tmp["mf"] = mf.astype(int)
+
+    def _rmse_masked(y, yhat, m):
+        y = np.asarray(y, dtype=float)
+        yhat = np.asarray(yhat, dtype=float)
+        m = np.asarray(m, dtype=bool)
+        if m.sum() == 0:
+            return np.nan
+        return float(np.sqrt(np.mean((y[m] - yhat[m]) ** 2)))
+
+    rows = []
+    for k, g in tmp.groupby(group_cols, dropna=False):
+        r_b = _rmse_masked(g["yb_true"], g["yb_pred"], g["mb"])
+        r_f = _rmse_masked(g["yf_true"], g["yf_pred"], g["mf"])
+        n_b = int(g["mb"].sum())
+        n_f = int(g["mf"].sum())
+        rec = {}
+        if len(group_cols) == 1:
+            rec[group_cols[0]] = k
+        else:
+            rec.update(dict(zip(group_cols, k)))
+        rec.update({"n_B": n_b, "rmse_B": r_b, "n_F": n_f, "rmse_F": r_f})
+        rows.append(rec)
+
+    out = pd.DataFrame(rows)
     print(f"\n== {title} ==")
-    print(grp[group_cols + ["rmse"]].to_string(index=False))
-
-
-def top_bits_via_gradients(
-    model: tf.keras.Model,
-    X: np.ndarray,
-    t_idx: np.ndarray,
-    a_idx: np.ndarray,
-    n_top: int = 30,
-    max_samples: int = 4096,
-    seed: int = 0,
-) -> List[Tuple[int, float]]:
-    """
-    Very rough global importance: mean(|grad * input|) across samples.
-    """
-    rng = np.random.default_rng(seed)
-    n = X.shape[0]
-    take = min(n, max_samples)
-    sel = rng.choice(n, size=take, replace=False)
-
-    Xs = tf.convert_to_tensor(X[sel], dtype=tf.float32)
-    ts = tf.convert_to_tensor(t_idx[sel], dtype=tf.int32)
-    a_s = tf.convert_to_tensor(a_idx[sel], dtype=tf.int32)
-
-    with tf.GradientTape() as tape:
-        tape.watch(Xs)
-        yhat = model([Xs, ts, a_s], training=False)
-        yhat = tf.squeeze(yhat, axis=1)
-
-    grads = tape.gradient(yhat, Xs).numpy()
-    scores = np.mean(np.abs(grads * X[sel]), axis=0)
-    top = np.argsort(-scores)[:n_top]
-    return [(int(i), float(scores[i])) for i in top]
+    # sort by worst of the two (ignoring nan)
+    out["worst"] = np.nanmax(out[["rmse_B", "rmse_F"]].to_numpy(dtype=float), axis=1)
+    out = out.sort_values("worst", ascending=True).drop(columns=["worst"])
+    print(out.to_string(index=False))
 
 
 def main():
@@ -318,20 +391,26 @@ def main():
     ap.add_argument("--batch", type=int, default=512)
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--no_single_protein_only", action="store_true", help="Do not restrict to SINGLE PROTEIN targets.")
-    ap.add_argument("--dump_bits", action="store_true", help="Compute and save rough top fingerprint-bit importances.")
-    ap.add_argument("--outdir", type=str, default="mono_sar_out")
+    ap.add_argument("--outdir", type=str, default="mono_sar_out_twohead")
     args = ap.parse_args()
 
     os.makedirs(args.outdir, exist_ok=True)
 
-    # Download ChEMBL SQLite if not provided
+    # Reproducibility (best-effort)
+    tf.keras.utils.set_random_seed(args.seed)
+    np.random.seed(args.seed)
+
+    # Optional: silence GPU warnings / force CPU (uncomment if desired)
+    # os.environ["CUDA_VISIBLE_DEVICES"] = "-1"
+    # os.environ["TF_CPP_MIN_LOG_LEVEL"] = "2"
+
     if not args.chembl_sqlite:
         try:
             import chembl_downloader  # type: ignore
         except Exception as e:
             raise SystemExit("chembl_downloader not installed. Try: pip install chembl_downloader") from e
         print("[info] No --chembl_sqlite provided; downloading/extracting latest ChEMBL SQLite...")
-        args.chembl_sqlite = chembl_downloader.download_extract_sqlite()  # returns path to .db
+        args.chembl_sqlite = chembl_downloader.download_extract_sqlite()
 
     print("[info] Using ChEMBL SQLite:", args.chembl_sqlite)
 
@@ -348,55 +427,98 @@ def main():
     df["smiles"] = df["smiles"].progress_apply(lambda s: canonicalize_smiles(s))
     df = df.dropna(subset=["smiles"])
 
-    # Aggregate replicate measurements: median pChEMBL per (molecule, target, assay_type)
-    df = df.groupby(["smiles", "target_chembl_id", "assay_type"], as_index=False).agg(
+    # Aggregate replicate measurements to median pChEMBL per (smiles, target, standard_type, assay_type)
+    df = df.groupby(["smiles", "target_chembl_id", "standard_type", "assay_type"], as_index=False).agg(
         pchembl_value=("pchembl_value", "median"),
         target_name=("target_name", "first"),
     )
 
-    print("\n[dataset] rows:", len(df))
-    print("[dataset] unique molecules:", df["smiles"].nunique())
-    print("[dataset] targets:", sorted(df["target_chembl_id"].unique().tolist()))
-    print("[dataset] assay_type counts:\n", df["assay_type"].value_counts())
+    print("\n[dataset long] rows:", len(df))
+    print("[dataset long] unique molecules:", df["smiles"].nunique())
+    print("[dataset long] assay_type counts:\n", df["assay_type"].value_counts())
+    print("[dataset long] standard_type counts:\n", df["standard_type"].value_counts())
 
-    # Build molecule list and scaffold split on molecules (prevents leakage across targets/assay_types)
-    uniq_smiles = df["smiles"].unique().tolist()
+    # Pivot into "two-head" samples: one row per (smiles, target, standard_type)
+    wide = df.pivot_table(
+        index=["smiles", "target_chembl_id", "standard_type", "target_name"],
+        columns="assay_type",
+        values="pchembl_value",
+        aggfunc="median",
+    ).reset_index()
+
+    # Build masks + fill missing labels with 0 (ignored by mask)
+    wide["y_B"] = pd.to_numeric(wide.get("B"), errors="coerce")
+    wide["y_F"] = pd.to_numeric(wide.get("F"), errors="coerce")
+    wide["m_B"] = (~wide["y_B"].isna()).astype(np.float32)
+    wide["m_F"] = (~wide["y_F"].isna()).astype(np.float32)
+    wide["y_B"] = wide["y_B"].fillna(0.0).astype(np.float32)
+    wide["y_F"] = wide["y_F"].fillna(0.0).astype(np.float32)
+
+    # Some rows might have neither B nor F (shouldn't happen), but drop them
+    wide = wide[(wide["m_B"] + wide["m_F"]) > 0].reset_index(drop=True)
+
+    print("\n[dataset wide] rows:", len(wide))
+    print("[dataset wide] B-labeled rows:", int(wide["m_B"].sum()))
+    print("[dataset wide] F-labeled rows:", int(wide["m_F"].sum()))
+
+    # Split on unique molecules (by scaffold)
+    uniq_smiles = wide["smiles"].unique().tolist()
     split = greedy_scaffold_split(uniq_smiles, frac_val=0.15, frac_test=0.15, seed=args.seed)
 
-    smi_to_split = {}
+    train_set = set(split.train_idx.tolist())
+    val_set = set(split.val_idx.tolist())
+    test_set = set(split.test_idx.tolist())
+
+    smi_to_split: Dict[str, str] = {}
     for i, smi in enumerate(uniq_smiles):
-        if i in set(split.train_idx):
+        if i in train_set:
             smi_to_split[smi] = "train"
-        elif i in set(split.val_idx):
+        elif i in val_set:
             smi_to_split[smi] = "val"
         else:
             smi_to_split[smi] = "test"
 
-    df["split"] = df["smiles"].map(smi_to_split)
-    train_df = df[df["split"] == "train"].reset_index(drop=True)
-    val_df = df[df["split"] == "val"].reset_index(drop=True)
-    test_df = df[df["split"] == "test"].reset_index(drop=True)
-
-    # Encode categorical inputs
-    targets_sorted = sorted(df["target_chembl_id"].unique().tolist())
-    target_to_idx = {t: i for i, t in enumerate(targets_sorted)}
-    assay_to_idx = {"B": 0, "F": 1}
-
-    def featurize_rows(rows: pd.DataFrame) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-        smiles = rows["smiles"].tolist()
-        X = morgan_fp_bits(smiles, radius=args.radius, n_bits=args.n_bits)
-        t_idx = rows["target_chembl_id"].map(target_to_idx).to_numpy(dtype=np.int32)
-        a_idx = rows["assay_type"].map(assay_to_idx).to_numpy(dtype=np.int32)
-        y = rows["pchembl_value"].to_numpy(dtype=np.float32)
-        return X, t_idx, a_idx, y
-
-    Xtr, ttr, atr, ytr = featurize_rows(train_df)
-    Xva, tva, ava, yva = featurize_rows(val_df)
-    Xte, tte, ate, yte = featurize_rows(test_df)
+    wide["split"] = wide["smiles"].map(smi_to_split)
+    train_df = wide[wide["split"] == "train"].reset_index(drop=True)
+    val_df = wide[wide["split"] == "val"].reset_index(drop=True)
+    test_df = wide[wide["split"] == "test"].reset_index(drop=True)
 
     print("\n[split sizes] train/val/test rows:", len(train_df), len(val_df), len(test_df))
 
-    model = build_model(fp_dim=args.n_bits, n_targets=len(targets_sorted), n_assay_types=2)
+    # Encode categoricals
+    targets_sorted = sorted(wide["target_chembl_id"].unique().tolist())
+    target_to_idx = {t: i for i, t in enumerate(targets_sorted)}
+    std_sorted = sorted(wide["standard_type"].unique().tolist())
+    std_to_idx = {s: i for i, s in enumerate(std_sorted)}
+
+    # Fingerprint cache (unique SMILES in wide table)
+    fp_cache = morgan_fp_cache(uniq_smiles, radius=args.radius, n_bits=args.n_bits)
+
+    def featurize(rows: pd.DataFrame):
+        smiles = rows["smiles"].tolist()
+        X = build_X_from_cache(smiles, fp_cache, n_bits=args.n_bits)
+        t_idx = rows["target_chembl_id"].map(target_to_idx).to_numpy(dtype=np.int32)
+        s_idx = rows["standard_type"].map(std_to_idx).to_numpy(dtype=np.int32)
+
+        # Pack y + mask for each head: shape (N, 2)
+        yb = rows["y_B"].to_numpy(dtype=np.float32)
+        mb = rows["m_B"].to_numpy(dtype=np.float32)
+        yf = rows["y_F"].to_numpy(dtype=np.float32)
+        mf = rows["m_F"].to_numpy(dtype=np.float32)
+
+        yb_pack = np.stack([yb, mb], axis=1)
+        yf_pack = np.stack([yf, mf], axis=1)
+        return X, t_idx, s_idx, yb_pack, yf_pack, yb, mb, yf, mf
+
+    Xtr, ttr, str_, yb_tr_pack, yf_tr_pack, yb_tr, mb_tr, yf_tr, mf_tr = featurize(train_df)
+    Xva, tva, sva, yb_va_pack, yf_va_pack, yb_va, mb_va, yf_va, mf_va = featurize(val_df)
+    Xte, tte, ste, yb_te_pack, yf_te_pack, yb_te, mb_te, yf_te, mf_te = featurize(test_df)
+
+    model = build_twohead_model(
+        fp_dim=args.n_bits,
+        n_targets=len(targets_sorted),
+        n_std_types=len(std_sorted),
+    )
     model.summary()
 
     callbacks = [
@@ -405,39 +527,59 @@ def main():
     ]
 
     model.fit(
-        {"fp": Xtr, "target_id": ttr, "assay_type": atr},
-        ytr,
-        validation_data=({"fp": Xva, "target_id": tva, "assay_type": ava}, yva),
+        {"fp": Xtr, "target_id": ttr, "standard_type": str_},
+        {"out_B": yb_tr_pack, "out_F": yf_tr_pack},
+        validation_data=(
+            {"fp": Xva, "target_id": tva, "standard_type": sva},
+            {"out_B": yb_va_pack, "out_F": yf_va_pack},
+        ),
         epochs=args.epochs,
         batch_size=args.batch,
         verbose=2,
         callbacks=callbacks,
     )
 
-    # Evaluate
-    yhat = model.predict({"fp": Xte, "target_id": tte, "assay_type": ate}, batch_size=args.batch, verbose=0).reshape(-1)
-    overall = rmse(yte, yhat)
-    print("\n[Test] overall RMSE:", overall)
+    # Predict
+    pred_b, pred_f = model.predict(
+        {"fp": Xte, "target_id": tte, "standard_type": ste},
+        batch_size=args.batch,
+        verbose=0,
+    )
+    pred_b = pred_b.reshape(-1).astype(np.float32)
+    pred_f = pred_f.reshape(-1).astype(np.float32)
 
-    report_group_rmse(test_df, yte, yhat, ["target_chembl_id"], "Test RMSE by target")
-    report_group_rmse(test_df, yte, yhat, ["assay_type"], "Test RMSE by assay_type")
-    report_group_rmse(test_df, yte, yhat, ["target_chembl_id", "assay_type"], "Test RMSE by target + assay_type")
+    # Compute masked RMSE per head
+    def _rmse_masked(y, yhat, m):
+        m = (m.astype(np.float32) > 0.5)
+        if m.sum() == 0:
+            return float("nan")
+        return float(np.sqrt(np.mean((y[m] - yhat[m]) ** 2)))
+
+    rmse_b = _rmse_masked(yb_te, pred_b, mb_te)
+    rmse_f = _rmse_masked(yf_te, pred_f, mf_te)
+    print("\n[Test] RMSE_B:", rmse_b)
+    print("[Test] RMSE_F:", rmse_f)
+
+    report_group_rmse_twohead(
+        test_df,
+        yb_true=yb_te, yb_pred=pred_b, mb=mb_te,
+        yf_true=yf_te, yf_pred=pred_f, mf=mf_te,
+        group_cols=["target_chembl_id"],
+        title="Test RMSE by target (B and F heads)",
+    )
 
     # Save predictions
-    out_pred = test_df.copy()
-    out_pred["y_true"] = yte
-    out_pred["y_pred"] = yhat
-    out_csv = os.path.join(args.outdir, "test_predictions.csv")
-    out_pred.to_csv(out_csv, index=False)
-    print("\n[Saved]", out_csv)
+    out = test_df.copy()
+    out["yB_true"] = yb_te
+    out["mB"] = mb_te
+    out["yF_true"] = yf_te
+    out["mF"] = mf_te
+    out["yB_pred"] = pred_b
+    out["yF_pred"] = pred_f
 
-    # Optional: rough global bit importance
-    if args.dump_bits:
-        top = top_bits_via_gradients(model, Xte, tte, ate, n_top=50, seed=args.seed)
-        bits_df = pd.DataFrame(top, columns=["bit", "importance"])
-        bits_path = os.path.join(args.outdir, "top_bits_grad_times_input.csv")
-        bits_df.to_csv(bits_path, index=False)
-        print("[Saved]", bits_path)
+    out_csv = os.path.join(args.outdir, "test_predictions.csv")
+    out.to_csv(out_csv, index=False)
+    print("\n[Saved]", out_csv)
 
 
 if __name__ == "__main__":
