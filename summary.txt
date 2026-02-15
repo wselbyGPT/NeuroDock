@@ -1,0 +1,17 @@
+Rows: 5616
+Overall RMSE: 0.9280
+Overall MAE : 0.7119
+Overall bias(pred-true): -0.1847
+Overall R2  : 0.3591
+
+Worst targets by RMSE:
+  CHEMBL228 (Sodium-dependent serotonin transporter): RMSE 1.085, bias -0.432, n 1358
+  CHEMBL224 (5-hydroxytryptamine receptor 2A): RMSE 0.954, bias -0.136, n 1004
+  CHEMBL217 (D(2) dopamine receptor): RMSE 0.867, bias -0.101, n 931
+
+Assay type:
+  F: RMSE 1.123, bias -0.401, n 527
+  B: RMSE 0.905, bias -0.162, n 5089
+
+Linear fit y_pred ~ a*y_true + b:
+  slope=0.4885 intercept=3.3639
